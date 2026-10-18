@@ -798,7 +798,7 @@ def calculate_momentum_strategy(
     n_positions=8, market_mode='50%', backtest_years=15,
     sector_limit=None
 ):
-    """V2: Signal am abgeschlossenen NYSE-Wochenschluss,
+    """Signal am abgeschlossenen NYSE-Wochenschluss,
     Ausführung zum NÄCHSTEN Handelstagsschluss (simulierte MOC-Order).
     holding_days=5: jede Woche; =10: jede zweite; =20: jede vierte Woche.
     Transaktionskosten = 0, Cashzins = 0.
@@ -999,6 +999,7 @@ def calculate_momentum_strategy(
                     'execution_date': str(effective.date()) if effective is not None else None,
                     'tickers': list(selected) if exposure > 0 else [],
                     'qualified_tickers': list(selected),
+                    'scores': {sym: round(float(scores.get(sym, 0.0)), 8) for sym in selected},
                     'exposure_pct': float(exposure * len(selected) / n_positions * 100),
                 })
                 # Ohne Portfolio- oder deutliche Expositionsaenderung keine Order.
@@ -1091,12 +1092,12 @@ def calculate_momentum_strategy(
         }
         return holdings_df, track, kpis
     except Exception as exc:
-        MOMENTUM_LOG.exception('Momentum-V2-Berechnung fehlgeschlagen')
+        MOMENTUM_LOG.exception('Momentum-Berechnung fehlgeschlagen')
         st.error(f'Momentum-Berechnung ({holding_days} Tage) fehlgeschlagen: {exc}')
         return pd.DataFrame(), pd.DataFrame(), {}
 
 # -------------------------------------------------------------
-# V7: EURO-DEPOT-SIMULATION FÜR MOMENTUM
+# EURO-DEPOT-SIMULATION FÜR MOMENTUM
 # -------------------------------------------------------------
 def german_stock_tax_rate(church_tax_percent=0):
     """Abgeltungsteuer inkl. Soli und Kirchensteuer-Modell bei §32d EStG.
@@ -1112,7 +1113,7 @@ def simulate_momentum_eur_depot(
     variable_fee_pct=0.1, saver_allowance=1000.0, church_tax=0,
     include_tax=True, fractions=False, min_order=10.0,
 ):
-    """Simuliert echte Geldbeträge anhand der Zielgewichts-Events der V6-Strategie.
+    """Simuliert echte Geldbeträge anhand der Zielgewichts-Events der Momentumstrategie.
 
     Aktienkurse sind auto-adjusted: daher nur *modellierte* Einstandskurse,
     nicht steuerlich richtige Broker-Einstandskurse. Keine tatsächliche
@@ -1145,7 +1146,7 @@ def simulate_momentum_eur_depot(
     missing_columns = [t for t in names if t not in closes.columns]
     if missing_columns:
         raise ValueError(f'Handelsdaten fehlen für: {", ".join(missing_columns[:8])}')
-    # V7.1: Nicht über sämtliche historischen Zeilen hinweg NaN verlangen.
+    # Kurslücken im historischen Download periodengerecht prüfen.
     # Vor dem Börsengang einer Aktie fehlen naturgemäß Kurse. Entscheidend ist,
     # dass die Aktie an ihrem Kauftag und während der Haltedauer handelbar ist.
     fee_rate = float(variable_fee_pct) / 100.0
@@ -1357,7 +1358,13 @@ def simulate_momentum_eur_depot(
 
 
 
-@st.cache_data(ttl=3600, max_entries=8, show_spinner=False)
+# Keine Cache-Dekoration: `index` ist ein pandas.DatetimeIndex.
+# Streamlit kann diesen in einigen Umgebungen nicht zuverlässig hashen.
+# Ein Ausschluss von `index` aus dem Cache-Schlüssel per `_index` wäre
+# fachlich falsch: System A und B können unterschiedliche Zeiträume
+# simulieren, was zu vermischten Benchmark-Ergebnissen führen könnte.
+# Diese reine Buy-and-Hold-Rechnung ist leichtgewichtig; die aufwendigen
+# Datenabrufe und Momentum-Backtests bleiben separat gecacht.
 def simulate_spy_buy_hold_eur(
     spy_prices, eurusd, index, capital=8000.0, fixed_fee=1.0,
     variable_fee_pct=0.1, saver_allowance=1000.0, church_tax=0,
@@ -1692,7 +1699,7 @@ def gaussian_mc(log_returns_mean, log_returns_std, capital, monthly_save, years,
 
     Einzahlung EXAKT alle 21 simulierten Börsentage (12-mal je Modelljahr),
     jeweils nach der Wertentwicklung des Einzahlungsmonats.
-    Rückgabe-Signatur wie V6, damit beide bestehenden Tabs unverändert aufrufbar sind.
+    Rückgabe-Signatur bleibt kompatibel zu den bestehenden Monte-Carlo-Reitern.
     """
     years = int(years)
     n_days = 252 * years
@@ -2226,503 +2233,192 @@ if tab6.open:
                     "Die Differenz ist eine rechnerische Steuerersparnis, **keine zugesagte Erstattung**.")
 
 
-# Depot- und Journalfunktionen müssen außerhalb jeder tabX.open-Bedingung stehen,
-# damit Tab 7 auch bei direktem Aufruf ohne vorherigen Besuch von Tab 6 funktioniert.
 # ================================================================
-# V10.1: PERSOENLICHER DEPOTMODUS (global, unabhängig von lazy Tabs)
-# Speicherung waehrend der Session, dauerhafte JSON-Datei via Export/Import.
+# SIGNAL-COCKPIT: REINE MODELLSIGNALE, KEINE BROKER-DEPOTBUCHHALTUNG
+# Die Signalhistorie wird aus zeitlich korrekten Backtest-Snapshots gebildet.
+# Eine explizit exportierbare Signal-Sicherung speichert Originalanzeigen,
+# da Streamlit Cloud ohne externe Datenbank KEINE dauerhafte Speicherung bietet.
 # ================================================================
 import json
 import re
-import math
-from copy import deepcopy
+from hashlib import sha256
 
-_MT_DEPOT_SCHEMA = 1
-_MT_SYMBOL_PATTERN = re.compile(r'^[A-Z0-9][A-Z0-9.\-]{0,14}$')
+_MT_SIGNAL_ARCHIVE_SCHEMA = 1
 
 
-def mt_depot_now():
-    return datetime.now(ZoneInfo('Europe/Berlin')).isoformat(timespec='seconds')
+def mt_signal_record(system, kpis, settings):
+    """Erzeugt einen eindeutigen Snapshot für System/Parameter/Signaltermin."""
+    snaps = kpis.get('signal_snapshots') or []
+    if not snaps:
+        return None
+    last = snaps[-1]
+    source = {
+        'system': str(system),
+        'signal_date': str(last['signal_date']),
+        'settings': settings,
+    }
+    key = sha256(json.dumps(source, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
+    return {
+        'id': key,
+        'system': str(system),
+        'signal_date': str(last['signal_date']),
+        # Zeitpunkt der ERSTEN Speicherung, nicht des historischen Signals.
+        'first_seen_at': datetime.now(ZoneInfo('Europe/Berlin')).isoformat(timespec='seconds'),
+        'execution_date': last.get('execution_date'),
+        'tickers': [str(x) for x in last.get('tickers', [])],
+        'exposure_pct': round(float(last.get('exposure_pct', 0.0)), 6),
+        'scores': {str(t): float(v) for t,v in (last.get('scores') or {}).items()},
+        'settings': settings,
+    }
 
 
-def mt_depot_empty():
-    return {'schema_version': _MT_DEPOT_SCHEMA, 'strategy': 'A',
-            'cash_eur': 0.0, 'positions': {}, 'journal': [],
-            'acknowledged_signal': None, 'updated_at': mt_depot_now()}
+def mt_archive_merge(archive, record):
+    """First write wins: gleiche ID niemals stillschweigend überschreiben."""
+    merged = dict(archive)
+    if record is not None and record['id'] not in merged:
+        merged[record['id']] = dict(record)
+    return merged
 
 
-def mt_depot_number(value, name, allow_zero=True):
-    try:
-        value = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f'{name}: ungültiger Zahlenwert.') from exc
-    if not math.isfinite(value) or value < 0 or (not allow_zero and value == 0) or value > 1e9:
-        raise ValueError(f'{name}: Wert muss endlich und zwischen 0 und 1 Mrd. liegen.')
-    return value
+def mt_validate_archive(data):
+    if not isinstance(data, dict) or data.get('schema_version') != _MT_SIGNAL_ARCHIVE_SCHEMA:
+        raise ValueError('Unbekanntes Signalarchiv-Format.')
+    items = data.get('signals')
+    if not isinstance(items, list) or len(items) > 1000:
+        raise ValueError('Ungültige Anzahl von Signalen im Archiv.')
+    valid = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError('Ungültiger Signal-Datensatz.')
+        for required in ('id', 'system', 'signal_date', 'tickers', 'exposure_pct', 'settings'):
+            if required not in item:
+                raise ValueError(f'Fehlendes Archivfeld: {required}')
+        if not (isinstance(item['id'], str) and re.fullmatch(r'[0-9a-f]{24}',item['id'])):
+            raise ValueError('Ungültige Signal-ID.')
+        if item['system'] not in ('A','B') or not isinstance(item['tickers'], list):
+            raise ValueError('Ungültiges System oder Aktienliste.')
+        if len(item['tickers']) > 20 or not all(isinstance(t,str) and re.fullmatch(r'[A-Z0-9.\-]{1,16}',t) for t in item['tickers']):
+            raise ValueError('Ungültige Ticker in der Signaldatei.')
+        exp = float(item['exposure_pct'])
+        if not np.isfinite(exp) or not 0 <= exp <= 100:
+            raise ValueError('Ungültige Aktienquote in der Signaldatei.')
+        if not isinstance(item['settings'], dict):
+            raise ValueError('Ungültige Parametereinstellungen.')
+        pd.Timestamp(item['signal_date'])
+        if item.get('execution_date'):
+            pd.Timestamp(item['execution_date'])
+        valid[item['id']] = dict(item)
+    return valid
 
 
-def mt_depot_ticker(value):
-    ticker = str(value).strip().upper().replace('.', '-')
-    if not _MT_SYMBOL_PATTERN.fullmatch(ticker):
-        raise ValueError(f'Ungültiges Aktienkürzel: {str(value)[:30]}')
-    return ticker
-
-
-def mt_depot_validate(state):
-    """Validiert JSON-Backup strikt; liest weder Code noch fremde Dateipfade."""
-    if not isinstance(state, dict) or state.get('schema_version') != _MT_DEPOT_SCHEMA:
-        raise ValueError('Unbekanntes Backup-Format. Erwartet: Finanz-Multitool Depot V8 (Version 1).')
-    strategy = state.get('strategy')
-    if strategy not in ('A', 'B'):
-        raise ValueError('Strategie muss A oder B sein.')
-    positions = state.get('positions')
-    if not isinstance(positions, dict) or len(positions) > 100:
-        raise ValueError('Ungültige Positionsliste (maximal 100).')
-    cleaned = {}
-    for symbol, data in positions.items():
-        sym = mt_depot_ticker(symbol)
-        if sym in cleaned or not isinstance(data, dict):
-            raise ValueError('Doppelte oder ungültige Depotposition.')
-        quantity = mt_depot_number(data.get('quantity'), f'{sym} Stückzahl', False)
-        cost = mt_depot_number(data.get('avg_entry_eur', 0), f'{sym} Ø Einstand')
-        cleaned[sym] = {'quantity': quantity, 'avg_entry_eur': cost}
-    journal = state.get('journal', [])
-    if not isinstance(journal, list) or len(journal) > 5000:
-        raise ValueError('Ungültiges Handelsjournal (maximal 5.000 Einträge).')
-    safe_journal = []
-    for row in journal:
-        if not isinstance(row, dict) or len(row) > 16:
-            raise ValueError('Ungültiger Journaleintrag.')
-        safe_journal.append({str(k)[:40]: str(v)[:200] if isinstance(v, str) else v
-                             for k, v in row.items() if isinstance(v, (str, int, float, bool, type(None)))})
-    acknowledged = state.get('acknowledged_signal')
-    if acknowledged is not None and (not isinstance(acknowledged, str) or len(acknowledged) > 200):
-        raise ValueError('Ungültiges letztes Signal.')
-    return {'schema_version': _MT_DEPOT_SCHEMA, 'strategy': strategy,
-            'cash_eur': mt_depot_number(state.get('cash_eur'), 'Cash'),
-            'positions': cleaned, 'journal': safe_journal,
-            'acknowledged_signal': acknowledged, 'updated_at': str(state.get('updated_at', ''))[:50]}
-
-
-def mt_depot_backup_bytes(state):
-    normalized = mt_depot_validate(state)
-    return json.dumps(normalized, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
-
-
-def mt_depot_import_bytes(raw):
-    if len(raw) > 1024 * 1024:
-        raise ValueError('Backup ist größer als 1 MB.')
-    try:
-        obj = json.loads(raw.decode('utf-8-sig'))
-    except (ValueError, UnicodeError) as exc:
-        raise ValueError('Datei enthält kein gültiges JSON.') from exc
-    return mt_depot_validate(obj)
-
-
-def mt_depot_log(state, kind, symbol='', qty=0, price=0, fee=0, tax=0, note='', trade_date=None):
-    state['journal'].append({
-        'Zeitpunkt': str(trade_date or mt_depot_now()), 'Art': str(kind),
-        'Ticker': str(symbol), 'Stückzahl': round(float(qty), 7),
-        'Kurs EUR': round(float(price), 6), 'Gebühren EUR': round(float(fee), 2),
-        'Steuer EUR': round(float(tax), 2), 'Hinweis': str(note)[:200]
-    })
-    if len(state['journal']) > 5000:
-        state['journal'] = state['journal'][-5000:]
-    state['updated_at'] = mt_depot_now()
-
-
-def mt_depot_set_snapshot(state, rows, cash_eur):
-    new_state = deepcopy(mt_depot_validate(state))
-    new_positions = {}
-    for row in rows:
-        sym_raw = row.get('Ticker', '')
-        if sym_raw is None or pd.isna(sym_raw) or not str(sym_raw).strip():
-            continue
-        sym = mt_depot_ticker(sym_raw)
-        if sym in new_positions:
-            raise ValueError(f'Ticker {sym} ist doppelt erfasst.')
-        raw_qty = row.get('Stückzahl', 0)
-        qty = mt_depot_number(raw_qty, f'{sym}: Stückzahl')
-        cost = mt_depot_number(row.get('Ø Einstand EUR', 0), f'{sym}: Einstand')
-        if qty > 0:
-            new_positions[sym] = {'quantity': qty, 'avg_entry_eur': cost}
-    if len(new_positions) > 100:
-        raise ValueError('Zu viele Depotpositionen.')
-    changed = (new_positions != new_state['positions'] or
-               mt_depot_number(cash_eur, 'Cash') != new_state['cash_eur'])
-    new_state['positions'] = new_positions
-    new_state['cash_eur'] = mt_depot_number(cash_eur, 'Cash')
-    if changed:
-        mt_depot_log(new_state, 'BESTANDSABGLEICH', note='Manuelle Bestandseingabe; kein rekonstruierter Kauf/Verkauf')
-    return new_state
-
-
-def mt_depot_trade(state, side, ticker, quantity, price_eur, fees_eur=0, taxes_eur=0, trade_date=None):
-    new_state = deepcopy(mt_depot_validate(state))
-    sym = mt_depot_ticker(ticker)
-    qty = mt_depot_number(quantity, 'Stückzahl', False)
-    price = mt_depot_number(price_eur, 'Ausführungskurs EUR', False)
-    fee = mt_depot_number(fees_eur, 'Gebühren EUR')
-    tax = mt_depot_number(taxes_eur, 'Tatsächlicher Steuerabzug EUR')
-    position = new_state['positions'].get(sym, {'quantity': 0.0, 'avg_entry_eur': 0.0})
-    if side == 'KAUF':
-        debit = qty * price + fee + tax
-        if debit > new_state['cash_eur'] + 1e-7:
-            raise ValueError(f'Nicht genug Cash für den Kauf (benötigt {debit:,.2f} €).')
-        held = position['quantity']
-        weighted = ((held * position['avg_entry_eur'] + qty * price + fee) / (held + qty))
-        new_state['positions'][sym] = {'quantity': held + qty, 'avg_entry_eur': weighted}
-        new_state['cash_eur'] = max(0.0, new_state['cash_eur'] - debit)
-    elif side == 'VERKAUF':
-        held = position['quantity']
-        if qty > held + 1e-7:
-            raise ValueError(f'Verkauf überschreitet die gehaltenen Stücke ({held:g}).')
-        credit = qty * price - fee - tax
-        if credit < 0:
-            raise ValueError('Gebühren und Steuern übersteigen den Verkaufserlös.')
-        remaining = held - qty
-        if remaining <= 1e-7:
-            new_state['positions'].pop(sym, None)
-        else:
-            new_state['positions'][sym] = {'quantity': remaining,
-                                          'avg_entry_eur': position['avg_entry_eur']}
-        new_state['cash_eur'] += credit
-    else:
-        raise ValueError('Unbekannte Transaktionsart.')
-    mt_depot_log(new_state, side, sym, qty, price, fee, tax, trade_date=trade_date)
-    return new_state
-
-
-def mt_depot_cash(state, side, amount, trade_date=None):
-    new_state = deepcopy(mt_depot_validate(state))
-    value = mt_depot_number(amount, 'Betrag', False)
-    if side == 'EINZAHLUNG':
-        new_state['cash_eur'] += value
-    elif side == 'AUSZAHLUNG':
-        if value > new_state['cash_eur'] + 1e-7:
-            raise ValueError('Auszahlung übersteigt verfügbares Cash.')
-        new_state['cash_eur'] -= value
-    else:
-        raise ValueError('Unbekannte Cash-Buchung.')
-    mt_depot_log(new_state, side, note=f'{value:.2f} EUR', trade_date=trade_date)
-    return new_state
-
-
-def mt_depot_plan(state, target_frame, prices_eur, tolerance=0.02, min_trade_eur=50):
-    """Unverbindlicher Ziel-Ist-Abgleich nach EUR, nie eine Orderübermittlung."""
-    state = mt_depot_validate(state)
-    weights = {}
-    if not target_frame.empty:
-        for item in target_frame.to_dict('records'):
-            sym = mt_depot_ticker(item['Ticker'])
-            pct = float(item['Zielgewicht (%)'])
-            if not math.isfinite(pct) or not 0 <= pct <= 100:
-                raise ValueError('Ungültige Zielgewichte.')
-            weights[sym] = pct / 100.0
-    all_symbols = set(weights) | set(state['positions'])
-    missing = sorted(sym for sym in all_symbols if not math.isfinite(prices_eur.get(sym, math.nan))
-                     or prices_eur.get(sym, 0) <= 0)
-    if missing:
-        return [], math.nan, missing
-    nav = state['cash_eur'] + sum(pos['quantity'] * prices_eur[sym]
-                                  for sym, pos in state['positions'].items())
-    if nav <= 0:
-        return [], nav, []
+def mt_signal_actions(previous, current):
+    """Unterschied zwischen alten und neuen SOLL-Gewichten, kein Broker-Abgleich."""
+    old_names = previous.get('tickers', []) if previous else []
+    new_names = current.get('tickers', []) if current else []
+    old_total = float(previous.get('exposure_pct', 0)) if previous else 0.0
+    new_total = float(current.get('exposure_pct', 0)) if current else 0.0
+    old_each = old_total / len(old_names) if old_names else 0.0
+    new_each = new_total / len(new_names) if new_names else 0.0
+    old = {str(t): old_each for t in old_names}
+    new = {str(t): new_each for t in new_names}
     rows = []
-    for sym in sorted(all_symbols):
-        price = float(prices_eur[sym])
-        held = state['positions'].get(sym, {}).get('quantity', 0.0)
-        actual_eur = held * price
-        target_eur = nav * weights.get(sym, 0.0)
-        difference = target_eur - actual_eur
-        material = max(float(min_trade_eur), nav * float(tolerance))
-        if weights.get(sym, 0.0) == 0 and held > 0:
-            action, quantity = 'VERKAUF', held
-        elif held == 0 and weights.get(sym, 0.0) > 0:
-            quantity = math.floor(max(0.0, difference) / price)
-            action = 'KAUF' if quantity >= 1 else 'KAUF NICHT MÖGLICH (1 STÜCK ZU TEUER)'
-        elif abs(difference) < material:
-            action, quantity = 'HALTEN', 0.0
-        elif difference > 0:
-            quantity = math.floor(difference / price)
-            action = 'KAUF' if quantity >= 1 else 'HALTEN (UNTER 1 AKTIE)'
+    for symbol in sorted(set(old) | set(new)):
+        a, b = old.get(symbol, 0.0), new.get(symbol, 0.0)
+        if a > 0 and b == 0:
+            action = 'Verkaufen'
+        elif b > 0 and a == 0:
+            action = 'Kaufen'
+        elif abs(a-b) >= 0.1:
+            action = 'Gewicht anpassen'
         else:
-            quantity = min(held, math.floor((-difference) / price))
-            action = 'VERKAUF' if quantity >= 1 else 'HALTEN (UNTER 1 AKTIE)'
-        rows.append({'Ticker': sym, 'Aktion': action,
-                     'Bestand (Stück)': held, 'Indikativer Kurs (€)': round(price, 2),
-                     'Ist-Wert (€)': round(actual_eur, 2), 'Ziel-Wert (€)': round(target_eur, 2),
-                     'Differenz (€)': round(difference, 2), 'Stück grob': quantity})
-    return rows, nav, []
+            action = 'Halten'
+        rows.append({'Ticker': symbol, 'Aktion': action,
+                     'Vorher (%)': round(a, 2), 'Neu (%)': round(b, 2),
+                     'Differenz (Prozentpunkte)': round(b-a, 2)})
+    priority = {'Verkaufen':0, 'Kaufen':1, 'Gewicht anpassen':2, 'Halten':3}
+    return pd.DataFrame(sorted(rows,key=lambda row:(priority[row['Aktion']],row['Ticker'])),
+                        columns=['Ticker','Aktion','Vorher (%)','Neu (%)','Differenz (Prozentpunkte)'])
 
 
-@st.cache_data(ttl=900, max_entries=16, show_spinner=False)
-def mt_depot_latest_quotes(tickers, asof_date):
-    """Unadjusted Aktien-Schlusskurse für EURO-Indikationen, keine Live-Brokerquotes."""
-    if not tickers:
-        return {}, None
-    selected = sorted({mt_depot_ticker(t) for t in tickers})
-    raw = yf.download(selected, period='1mo', auto_adjust=False,
-                      actions=False, progress=False, threads=False, group_by='column')
-    close = extract_yf_field(raw, 'Close')
-    if len(selected) == 1 and len(close.columns) == 1:
-        close.columns = selected
-    prices = {}
-    max_date = pd.Timestamp(asof_date).normalize()
-    for symbol in selected:
-        if symbol not in close:
-            continue
-        s = close[symbol].loc[:max_date].dropna()
-        if s.empty or (max_date - s.index[-1]).days > 8:
-            continue
-        px = float(s.iloc[-1])
-        if np.isfinite(px) and px > 0:
-            prices[symbol] = px
-    fx = fetch_historical('EURUSD=X', years=1)
-    fx = fx.loc[:max_date].dropna() if not fx.empty else pd.Series(dtype=float)
-    if fx.empty or (max_date - fx.index[-1]).days > 8 or fx.iloc[-1] <= 0:
-        return {}, None
-    eurusd = float(fx.iloc[-1])
-    return {t: value / eurusd for t, value in prices.items()}, eurusd
+def mt_signal_outcomes(close_full, snapshots, max_rows=100, risk_guard=None):
+    """Konservative Diagnostik ab Ausführungskurs bis zur NÄCHSTEN Ausführung.
 
-# ==========================================
-# V8: STREAMLIT-DEPOT-OBERFLAECHE
-# ==========================================
-def mt_live_depot_controls():
-    """V10.2: Zentrale manuelle Depotverwaltung statt verstecktem Seiten-Expander.
-
-    Ein Formular für alle realen Buchungen, getrennt von Simulationstrades.
-    Zustand wie bisher nur in st.session_state; JSON-Backup unverändert.
+    Gemittelte Asset-Returns * Signalaktienquote; nicht als exakte Depotperformance
+    zu interpretieren (u.a. intra-periodisches Gewichtedriften und Handelskosten).
+    Noch offene Perioden sind explizit nicht als abgeschlossener Test enthalten.
     """
-    if 'mt_live_depot' not in st.session_state:
-        st.session_state['mt_live_depot'] = mt_depot_empty()
-        st.session_state['mt_live_revision'] = 0
-    state = st.session_state['mt_live_depot']
-    rev = st.session_state['mt_live_revision']
-    st.subheader('📒 Mein echtes Depot & Handelstagebuch')
-    st.caption('**Echte Buchungen**, unabhängig von den simulierten Trades. '
-               'Keine automatische Orderübermittlung. Änderungen müssen als privates JSON gesichert werden.')
-    status_a, status_b, status_c = st.columns(3)
-    status_a.metric('Positionen', len(state['positions']))
-    status_b.metric('Verfügbares Cash', format_de(state['cash_eur']))
-    status_c.metric('Buchungen', len(state['journal']))
-    section_book, section_holdings, section_backup = st.tabs(
-        ['✏️ Neue Buchung', '📋 Bestand bearbeiten', '📚 Journal & Backup'])
-    with section_book:
-        st.caption('Hier dokumentierst du einen **tatsächlich ausgeführten** Trade '
-                   'oder eine Einzahlung/Auszahlung. Keine Modellorder wird automatisch gebucht.')
-        # Auswahl bewusst AUSSERHALB des Formulars: Streamlit-Forms aktualisieren
-        # abhängige Felder erst beim Submit. Die Eingabefelder müssen aber sofort
-        # beim Wechsel zwischen Kauf/Verkauf und Ein-/Auszahlung umschalten.
-        kind = st.selectbox('Buchungstyp', ['KAUF', 'VERKAUF', 'EINZAHLUNG', 'AUSZAHLUNG'],
-                            key=f'mt_live_kind_{rev}')
-        with st.form(f'mt_live_one_booking_{rev}', clear_on_submit=True):
-            if kind in ('KAUF', 'VERKAUF'):
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    ticker = st.text_input('Ticker (z. B. MSFT)', key=f'mt_live_ticker_{rev}')
-                with c2:
-                    qty = st.number_input('Stückzahl', min_value=0.000001, value=1.0,
-                                          format='%.6f', key=f'mt_live_qty_{rev}')
-                with c3:
-                    px = st.number_input('Ausführungskurs in € je Aktie',
-                                         min_value=0.01, value=100.0, key=f'mt_live_px_{rev}')
-                fee_c, tax_c = st.columns(2)
-                with fee_c:
-                    fee = st.number_input('Orderkosten (€)', min_value=0.0, value=0.0,
-                                          key=f'mt_live_fee_{rev}')
-                with tax_c:
-                    tax = st.number_input('Einbehaltene Steuer (€)', min_value=0.0, value=0.0,
-                                          key=f'mt_live_tax_{rev}')
-            else:
-                amount = st.number_input('Ein- / Auszahlungsbetrag (€)',
-                                         min_value=0.01, value=500.0,
-                                         key=f'mt_live_amount_{rev}')
-            date = st.date_input('Tatsächliches Buchungsdatum', value=datetime.now().date(),
-                                 key=f'mt_live_date_{rev}')
-            submit = st.form_submit_button('✅ Buchung übernehmen', use_container_width=True)
-        if submit:
-            try:
-                if kind in ('KAUF', 'VERKAUF'):
-                    updated = mt_depot_trade(state, kind, ticker, qty, px,
-                                             fees_eur=fee, taxes_eur=tax, trade_date=str(date))
-                else:
-                    updated = mt_depot_cash(state, kind, amount, trade_date=str(date))
-                st.session_state['mt_live_depot'] = updated
-                st.session_state['mt_live_revision'] += 1
-                st.rerun()
-            except ValueError as exc:
-                st.error(f'Buchung konnte nicht übernommen werden: {exc}')
-        if state['journal']:
-            st.caption('**Letzte Buchungen:**')
-            st.dataframe(pd.DataFrame(state['journal'][-5:]).iloc[::-1],
-                         hide_index=True, use_container_width=True)
-    with section_holdings:
-        choice = st.selectbox('Welches Momentum-System ist deine Depot-Referenz?',
-                              ['A', 'B'], index=0 if state['strategy'] == 'A' else 1,
-                              format_func=lambda x: 'A – 5 Tage' if x == 'A' else 'B – 10 Tage',
-                              key=f'mt_live_strategy_{rev}')
-        if choice != state['strategy']:
-            state['strategy'] = choice
-            state['acknowledged_signal'] = None
-            mt_depot_log(state, 'SYSTEMWECHSEL', note='Referenzsystem ' + choice)
-            st.session_state['mt_live_revision'] += 1
-            st.rerun()
-        st.caption('Für eine **einmalige Bestandsaufnahme** oder Korrektur. '
-                   'Spätere einzelne Käufe/Verkäufe bitte unter „Neue Buchung“ erfassen.')
-        rows = [{'Ticker': t, 'Stückzahl': v['quantity'],
-                 'Ø Einstand EUR': v['avg_entry_eur']}
-                for t, v in sorted(state['positions'].items())]
-        if not rows:
-            rows = [{'Ticker': '', 'Stückzahl': 0.0, 'Ø Einstand EUR': 0.0}]
-        with st.form(f'mt_live_snapshot_form_{rev}'):
-            edited = st.data_editor(pd.DataFrame(rows), num_rows='dynamic', hide_index=True,
-                                    use_container_width=True,
-                                    column_config={
-                                        'Ticker': st.column_config.TextColumn('Ticker'),
-                                        'Stückzahl': st.column_config.NumberColumn('Stückzahl', min_value=0.0),
-                                        'Ø Einstand EUR': st.column_config.NumberColumn(
-                                            'Ø Einstand EUR', min_value=0.0, format='%.2f')
-                                    }, key=f'mt_live_editor_{rev}')
-            cash = st.number_input('Vorhandenes Cash (€)', min_value=0.0,
-                                   value=float(state['cash_eur']), step=100.0,
-                                   key=f'mt_live_cash_{rev}')
-            saved = st.form_submit_button('Bestand übernehmen')
-        if saved:
-            try:
-                st.session_state['mt_live_depot'] = mt_depot_set_snapshot(
-                    state, edited.to_dict('records'), cash)
-                st.session_state['mt_live_revision'] += 1
-                st.rerun()
-            except ValueError as exc:
-                st.error(f'Bestand nicht übernommen: {exc}')
-    with section_backup:
-        st.warning('**Wichtig:** Streamlit Cloud speichert deine Depotdaten nur während '
-                   'der Browsersitzung. Nach jeder Buchung ein privates JSON-Backup herunterladen!')
-        st.download_button('⬇️ Depot und Journal sichern (JSON)',
-                           data=mt_depot_backup_bytes(st.session_state['mt_live_depot']),
-                           file_name='mein_momentum_depot.json', mime='application/json',
-                           key=f'mt_live_backup_{rev}', use_container_width=True)
-        upload = st.file_uploader('Gesichertes Depot wiederherstellen (JSON)',
-                                  type=['json'], key=f'mt_live_restore_{rev}')
-        if st.button('Backup importieren – ersetzt aktuellen Depotstand',
-                     disabled=(upload is None), key=f'mt_live_import_{rev}'):
-            try:
-                restored = mt_depot_import_bytes(upload.getvalue())
-                st.session_state['mt_live_depot'] = restored
-                st.session_state['mt_live_revision'] += 1
-                st.rerun()
-            except (ValueError, TypeError) as exc:
-                st.error(f'Backup konnte nicht importiert werden: {exc}')
-        st.markdown('**Vollständiges echtes Handelstagebuch**')
-        if state['journal']:
-            journal = pd.DataFrame(state['journal'])
-            st.dataframe(journal.iloc[::-1], hide_index=True, use_container_width=True)
-            st.download_button('⬇️ Journal als CSV exportieren',
-                               data=journal.to_csv(index=False).encode('utf-8-sig'),
-                               file_name='momentum_echte_trades.csv', mime='text/csv',
-                               key=f'mt_live_csv_{rev}')
+    columns = ['Signal','Ausführung','Ende','Status','Aktien','Aktienquote (%)',
+               'Signalzyklus-Rendite (%)','Schlechtester Titel','Schlechtester Titel (%)',
+               'Risikowert (0–100)']
+    if close_full is None or close_full.empty or not snapshots:
+        return pd.DataFrame(columns=columns)
+    prices = close_full.sort_index()
+    idx = pd.DatetimeIndex(prices.index).normalize()
+    items = list(snapshots)[-max_rows:]
+    rows=[]
+    for i,snap in enumerate(items):
+        start_raw = snap.get('execution_date')
+        if not start_raw:
+            continue
+        begin = pd.Timestamp(start_raw).normalize()
+        if begin not in idx:
+            if begin > idx[-1]:
+                rows.append({'Signal':snap['signal_date'],'Ausführung':str(begin.date()),
+                             'Ende':'–','Status':'Ausführung ausstehend',
+                             'Aktien':', '.join(snap.get('tickers') or []) or 'Cash',
+                             'Aktienquote (%)':round(float(snap.get('exposure_pct',0)),1),
+                             'Signalzyklus-Rendite (%)':np.nan,
+                             'Schlechtester Titel':'–','Schlechtester Titel (%)':np.nan,
+                             'Risikowert (0–100)':np.nan})
+            continue
+        if i+1 < len(items):
+            next_raw = items[i+1].get('execution_date')
+            end = pd.Timestamp(next_raw).normalize() if next_raw else idx[-1]
         else:
-            st.info('Noch keine Transaktionen dokumentiert.')
-
-
-def mt_live_depot_comparison(holdings_5, holdings_10, kpis_5, kpis_10, last_close_date):
-    state = st.session_state['mt_live_depot']
-    use_a = state['strategy'] == 'A'
-    frame = holdings_5 if use_a else holdings_10
-    kpi = kpis_5 if use_a else kpis_10
-    st.divider()
-    st.subheader('🧭 Mein Trading-Assistent – Depot gegen neues Signal')
-    st.caption('Nur **ein** Referenzsystem gleichzeitig. Zielportfolio und reale Bestände '
-               'werden getrennt geführt. Alle Ordermengen sind unverbindliche Schätzungen.')
-    symbol = 'A (wöchentlich)' if use_a else 'B (zweiwöchentlich)'
-    target_date = kpi.get('last_signal_date') or 'unbekannt'
-    next_session = kpi.get('next_execution') or 'unbekannt'
-    st.write(f'**Ausgewähltes System:** {symbol} · **Letztes Signal:** {target_date} '
-             f'· **Früheste Modell-Ausführung:** {next_session}')
-    from hashlib import sha256
-    fingerprint_payload = {'system': state['strategy'], 'date': target_date,
-                           'weights': sorted((str(row['Ticker']), round(float(row['Zielgewicht (%)']), 5))
-                                             for row in frame.to_dict('records'))}
-    signature = sha256(json.dumps(fingerprint_payload, sort_keys=True).encode()).hexdigest()[:40]
-    signature = state['strategy'] + ':' + signature
-    if state.get('acknowledged_signal') == signature:
-        st.info('Dieses Signal wurde bereits als geprüft markiert. '
-                'Änderungen am Depot werden trotzdem erneut verglichen.')
-    else:
-        st.info('Dieses Signal wurde noch nicht als geprüft markiert. '
-                'Eine Prüfung ist keine Kauf- oder Verkaufsbestätigung.')
-
-    desired = set(frame['Ticker'].astype(str)) if not frame.empty else set()
-    actual = set(state['positions'])
-    a1, a2, a3 = st.columns(3)
-    a1.metric('Aktuelle Depotpositionen', len(actual))
-    a2.metric('Neue Zielaktien', len(desired - actual))
-    a3.metric('Aus Ziel entfernt', len(actual - desired))
-    if not actual and state['cash_eur'] <= 0:
-        st.warning('Noch kein tatsächliches Depot eingetragen. Links unter '
-                   '„Mein echtes Depot“ die Bestände und Cash erfassen oder ein Backup importieren.')
-    else:
-        if desired - actual:
-            st.write('🟢 **Im Ziel, aber nicht im Depot:** ' + ', '.join(sorted(desired - actual)))
-        if actual - desired:
-            st.write('🔴 **Im Depot, aber nicht mehr im Ziel:** ' + ', '.join(sorted(actual - desired)))
-        if not (desired - actual or actual - desired):
-            st.success('Aktienauswahl stimmt überein. Positionsgrößen werden im nächsten Schritt geprüft.')
-
-        wanted = sorted(desired | actual)
-        try:
-            with st.spinner('Lade zuletzt verfügbare unbereinigte Schlusskurse für den Depotabgleich ...'):
-                quotes, fx = mt_depot_latest_quotes(tuple(wanted), str(last_close_date))
-        except Exception as exc:
-            LOG.warning('Depotpreise nicht verfügbar: %s', exc)
-            quotes, fx = {}, None
-        rows, equity, missing = mt_depot_plan(state, frame, quotes)
-        if missing:
-            st.warning('Für folgende Aktien fehlen verwendbare aktuelle EUR-Referenzkurse: '
-                       + ', '.join(missing) + '. Deshalb wird **keine Stückzahlorder** geschätzt. '
-                       'Der obige Tickervergleich ist davon nicht betroffen.')
-        elif not wanted:
-            st.info('Kein Aktienbestand und kein Aktiensignal. Eine etwaige Cashquote bleibt unverändert.')
+            end = idx[-1]
+        if end > idx[-1]:
+            end = idx[-1]
+            complete = False
         else:
-            st.metric('Depotwert auf Basis letzter Schlusskurse (indikativ)', format_de(equity))
-            st.caption(f'Unbereinigte USD-Schlusskurse bis {str(last_close_date)[:10]}, '
-                       f'umgerechnet mit EUR/USD ca. {fx:.4f}. '
-                       'Kein Echtzeitkurs, keine ausführbare Brokerquote. '
-                       'Gewinnsteuern, Spreads und Gebühren sind in dieser IST-Bewertung nicht pauschal enthalten.')
-            active_orders = [r for r in rows if r['Aktion'] in ('KAUF', 'VERKAUF')]
-            if not active_orders:
-                st.success('**Kein Handlungsbedarf nach aktueller Toleranz.** '
-                           'Es bestehen keine ausreichend großen Abweichungen, '
-                           'die sich mit ganzen Aktien abbilden lassen.')
-            else:
-                st.warning(f'**{len(active_orders)} mögliche Anpassungen** '
-                           '(bitte Kurse, Kosten und verfügbare Mittel manuell prüfen).')
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-            st.caption('Testschwelle: mindestens 50 € oder 2 % des Depotwerts für '
-                       'Gewichtsanpassungen bestehender Aktien. Beim vollständigen Ausscheiden '
-                       'einer Aktie wird unabhängig von der Schwelle VERKAUF angezeigt. '
-                       'Die Stückzahl ist auf ganze Aktien gerundet, Käufe sind nicht '
-                       'gegen verfügbare Liquidität optimiert. Verkaufsorders zuerst prüfen.')
-    if st.button('✅ Signal als geprüft markieren (führt KEINE Order aus)',
-                 key='mt_live_ack_signal', use_container_width=True):
-        state['acknowledged_signal'] = signature
-        mt_depot_log(state, 'SIGNAL_GEPRUEFT', note=f'{state["strategy"]} | {target_date}')
-        st.session_state['mt_live_revision'] += 1
-        st.rerun()
-    st.caption('Die Prüfung wird im Depot-Backup mitgesichert. '
-               'Nach tatsächlichem Handel müssen Käufe/Verkäufe links separat dokumentiert '
-               'und der neue Depotstand erneut als JSON gespeichert werden.')
+            complete = i+1 < len(items) and bool(items[i+1].get('execution_date'))
+        if end not in idx or end < begin:
+            continue
+        tickers = list(snap.get('tickers') or [])
+        exposure = float(snap.get('exposure_pct',0))/100.0
+        indiv={}
+        for ticker in tickers:
+            if ticker not in prices.columns:
+                continue
+            v0, v1 = prices.at[begin,ticker], prices.at[end,ticker]
+            if pd.notna(v0) and pd.notna(v1) and v0 > 0 and v1 > 0:
+                indiv[ticker] = float(v1/v0-1)
+        valid_cycle = len(indiv)==len(tickers) and end>begin
+        cycle_return = exposure * sum(indiv.values()) / len(tickers) if tickers and valid_cycle else (0.0 if not tickers and end>begin else np.nan)
+        worst = min(indiv,key=indiv.get) if indiv else '–'
+        risk = np.nan
+        if risk_guard is not None and not risk_guard.empty:
+            day = pd.Timestamp(snap['signal_date']).normalize()
+            if day in risk_guard.index:
+                risk = risk_guard.at[day,'Risikoscore_letztes_Signal']
+        rows.append({'Signal':snap['signal_date'], 'Ausführung':str(begin.date()),
+                     'Ende':str(end.date()), 'Status':'Abgeschlossen' if complete else 'Laufend',
+                     'Aktien':', '.join(tickers) if tickers else 'Cash',
+                     'Aktienquote (%)':round(exposure*100,1),
+                     'Signalzyklus-Rendite (%)':round(cycle_return*100,2) if np.isfinite(cycle_return) else np.nan,
+                     'Schlechtester Titel':worst,
+                     'Schlechtester Titel (%)':round(100*indiv[worst],2) if worst!='–' else np.nan,
+                     'Risikowert (0–100)':round(float(risk),1) if pd.notna(risk) else np.nan})
+    return pd.DataFrame(rows,columns=columns).iloc[::-1].reset_index(drop=True)
 
 # ==========================================
-# BLOCK 2: TAB 7 - S&P 500 DUAL-TRACKER (V2)
+# TAB 7 – S&P 500 DUAL-TRACKER
 # Ersetzt den bisherigen kompletten `with tab7:`-Block.
 # Beide Systeme A (5 Tage) und B (10 Tage) bleiben erhalten.
 # ==========================================
 if tab7.open:
     with tab7:
         # =============================
-        # V6: EINMALIGE, AUSSCHLIESSLICH ANKLICKBARE HILFE
+        # EINMALIGE, AUSSCHLIESSLICH ANKLICKBARE HILFE
         # Die Momentum-Engine, Scores, Risiken und Backtests bleiben unverändert.
         # Vermeidet doppelte Texte bei Mausbewegung.
         # =============================
@@ -2765,7 +2461,7 @@ if tab7.open:
                 'FIFO': 'First In, First Out: Beim Verkauf gelten die zuerst angeschafften Stücke einer Aktie modellhaft als zuerst verkauft.',
                 'Steuerlich modellierte Rendite': 'Depotwert nach bereits simulierten Steuerabzügen. Auf noch nicht verkaufte Gewinne können bei späterem Verkauf weitere Steuern anfallen.',
                 'Hypothetischer Liquidationswert': 'Der rechnerische Eurobetrag, wenn am letzten Testtag alle Aktien verkauft, Kosten bezahlt und zusätzliche Steuern modelliert würden.',
-                'Handelsjournal': 'Liste aller simulierten Käufe, Verkäufe, Gebühren und modellierten Steuerzahlungen; keine realen Brokerdaten.',
+                'Handelsjournal': 'Interne rechnerische Buchungen der Kosten-/Steuersimulation; es wird kein eigenes Broker-Handelstagebuch geführt.',
                 'Steuermodell-Grenzen': 'Adjusted-Close-Kurse bilden Dividenden/Corporate Actions nicht als echte Zahlung und Broker-Einstandskurse ab. Quellensteuer, steuerliche Einzelfälle, jahresbezogene Rechtsänderungen und Freistellungsaufträge bei anderen Instituten fehlen.',
             },
             'Aktientabelle': {
@@ -2779,8 +2475,9 @@ if tab7.open:
                 'Volatilität': 'Historische Schwankungsstärke über 90 Handelstage, auf ein Jahr hochgerechnet. Hohe Werte bedeuten größere Kursschwankungen und häufig auch höheres Risiko.',
                 'Kurs am Signaltag': 'Bereinigter Kurs, der für das letzte Signal genutzt wurde. Keine Zusage, dass du die Aktie heute zu diesem Preis kaufen kannst.',
                 'Zielgewicht (%)': 'Geplanter prozentualer Depotanteil der Aktie nach dem Signal. Beispiel: 50 % Aktienquote bei acht Plätzen ergibt 6,25 % pro Aktie.',
-                'Zielportfolio': 'Aktien, die das Modell nach dem letzten Signal halten möchte. Diese Liste entspricht NICHT automatisch deinem realen Brokerdepot.',
-                'Tickerdifferenz': 'Einfacher Vergleich zwischen Modell und deinen eingegebenen Symbolen. Zeigt nur fehlende oder zusätzliche Ticker – keine konkreten Stückzahlen oder Ordervorschläge.',
+                'Zielportfolio': 'Aktien, die das Modell nach dem letzten abgeschlossenen Signal halten möchte. Kein Brokerabgleich.',
+                'Signaldifferenz': 'Vergleich des neuen Zielportfolios mit dem vorherigen Modellsignal. Voraussetzung: Alle vergangenen Empfehlungen wurden tatsächlich umgesetzt. Stückzahlen und Broker-Ausführungskurse werden nicht geprüft.',
+                'Signaldiagnostik': 'Historische Zielaktien und ihre nachfolgenden Renditen. Die Signalzyklen sind keine Vorhersagen, sondern eine rückblickende Qualitätssicherung.',
             },
         }
         _mt_help = {name: description for chapter in _mt_glossary.values()
@@ -2820,7 +2517,7 @@ if tab7.open:
                         st.markdown(f'**{term}**')
                         st.write(_mt_help[term])
 
-        st.markdown('### 🚀 S&P 500 Dual-Tracker V7: 5 Tage vs. 10 Tage')
+        st.markdown('### 🚀 S&P 500 Momentum – Trading-Cockpit')
         st.caption('Manuelles Trading | Brutto-Backtest und optionaler Euro-Netto-Backtest | Signale nach NYSE-Schluss, '
                    'simulierte Ausführung zum Schlusskurs der nächsten NYSE-Sitzung')
         st.caption('💡 **Hilfe:** Klicke auf ⓘ für die Erklärung. '
@@ -2892,8 +2589,13 @@ if tab7.open:
                                                  'Kein Ersatz für Vorabpauschale, Ausschüttungen, Quellsteuer oder Steuerberatung.')
                 st.caption('Ohne Bruchstücke werden ganze Aktien gehandelt; nicht investierbares '
                            'Restgeld bleibt Cash. Fixkosten und variable Kosten gelten pro Einzelorder.')
-            st.caption('📒 **Echtes Handelstagebuch:** Jetzt direkt im Hauptbereich rechts oben – '
-                       'mit einer gemeinsamen Buchungsmaske und privatem Backup.')
+            st.caption('🎯 **Trading-Cockpit:** Ein verbindliches System, reine Soll-Signale '
+                       'und eine historische Qualitätskontrolle. Kein zusätzliches Broker-Handelsjournal.')
+            active_system = st.radio('Verbindliches Handelssystem', ['A','B'], horizontal=True,
+                                     format_func=lambda x: 'A – wöchentlich' if x=='A' else 'B – zweiwöchentlich',
+                                     key='mt_active_system')
+            st.caption('Die Auswahl gilt für diese Sitzung. Für dauerhafte Signalarchivierung '
+                       'kannst du unten einen Snapshot exportieren und wieder importieren.')
 
             st.caption('✅ Nach dem ersten Start werden geänderte Einstellungen automatisch neu berechnet.')
             run = st.button('🔄 Beide Systeme berechnen', type='primary',
@@ -2916,8 +2618,6 @@ if tab7.open:
                            'keine Renditeprognosen oder persönlichen Handelsempfehlungen.')
 
         with right:
-            mt_live_depot_controls()
-            st.divider()
             if not st.session_state.get('run_momentum', False):
                 st.info('Klicke links auf „Beide Systeme berechnen“.')
             else:
@@ -2961,7 +2661,102 @@ if tab7.open:
                                 return '–'
                             return f'{num:,.{digits}f}'.replace(',', 'X').replace('.', ',').replace('X', '.') + suffix
 
-                        # V7.1 – EURO-NETTO-BACKTEST AN ERSTER STELLE, SIGNALLOGIK UNVERÄNDERT
+                        # ===========================================================
+                        # VERBINDLICHER SIGNAL-ASSISTENT, OHNE ECHTES BROKER-DEPOT
+                        # ===========================================================
+                        st.divider()
+                        st.subheader('🎯 Trading-Cockpit: verbindliches Signal')
+                        active_stats = kpis_5 if active_system == 'A' else kpis_10
+                        active_snapshots = active_stats.get('signal_snapshots', [])
+                        settings_id = {'n_positions':positions,'hysterese_limit':hyst,
+                                       'market_mode':regime,'backtest_years':horizon,
+                                       'sector_limit':3 if sector_on and enough_sectors else None}
+                        current_record = mt_signal_record(active_system, active_stats, settings_id)
+                        if current_record is None:
+                            st.warning('Für das ausgewählte System liegt noch kein Signal vor.')
+                        else:
+                            if 'mt_signal_archive' not in st.session_state:
+                                st.session_state['mt_signal_archive'] = {}
+                            archive = st.session_state['mt_signal_archive']
+                            if current_record['id'] not in archive:
+                                archive[current_record['id']] = current_record
+                            frozen = archive[current_record['id']]
+                            if (frozen['tickers'] != current_record['tickers'] or
+                                    abs(float(frozen['exposure_pct'])-float(current_record['exposure_pct']))>0.01):
+                                st.error('⚠️ Die neu berechnete Aktienliste weicht vom gespeicherten '
+                                         'Originalsignal bei gleicher Konfiguration ab. Das ursprüngliche '
+                                         'Signal bleibt unverändert fixiert; bitte Datenqualität prüfen.')
+                            prior_record = mt_signal_record(active_system,
+                                {'signal_snapshots':active_snapshots[:-1]}, settings_id)
+                            if prior_record is not None and prior_record['id'] not in archive:
+                                archive[prior_record['id']] = prior_record
+                            preceding = archive.get(prior_record['id']) if prior_record else None
+                            plans = mt_signal_actions(preceding, frozen)
+                            signal_dt = pd.Timestamp(frozen['signal_date'])
+                            execute_dt = pd.Timestamp(frozen['execution_date']) if frozen.get('execution_date') else None
+                            last_data_dt = pd.Timestamp(close_all.index[-1]).normalize()
+                            is_pending = execute_dt is not None and execute_dt > last_data_dt
+                            sys_name = 'A – 5 Tage' if active_system == 'A' else 'B – 10 Tage'
+                            st.markdown(f'**Verbindliche Modellstrategie: {sys_name}**')
+                            st.caption('Signal-Snapshot erstmals gesichert: '
+                                       f"{frozen.get('first_seen_at', 'nicht dokumentiert')}" +
+                                       ' (ein nachträglich berechnetes Signal ist kein Beleg für eine '
+                                       'damals tatsächlich angezeigte Empfehlung).')
+                            _a,_b,_c=st.columns(3)
+                            _a.metric('Signal vom',signal_dt.strftime('%d.%m.%Y'))
+                            _b.metric('Geplante Ausführung',execute_dt.strftime('%d.%m.%Y') if execute_dt is not None else '–')
+                            _c.metric('Ziel-Aktienquote',f"{float(frozen['exposure_pct']):.1f} %")
+                            if is_pending:
+                                st.warning('**Neues Signal – Ausführung ausstehend.** '
+                                           'Modellannahme: Kurs der nächsten regulären NYSE-Sitzung zum Schluss. '
+                                           'Die tatsächliche Order musst du beim Broker platzieren.')
+                            else:
+                                st.info('**Letzter bereits simulierter Signalzyklus.** '
+                                        'Kein zusätzliches, noch ausstehendes Signal. '
+                                        'Nicht nachträglich zum historischen Ausführungspreis handeln.')
+                            if plans.empty:
+                                st.success('Keine Aktien im Zielportfolio (Cash).')
+                            else:
+                                changes = plans[plans['Aktion']!='Halten']
+                                if changes.empty:
+                                    st.success('Keine Änderung der Zielaktien zwischen den zwei letzten Signalen.')
+                                else:
+                                    st.markdown('**Änderungen zum vorherigen SOLL-Signal**')
+                                    st.dataframe(changes,hide_index=True,use_container_width=True)
+                                with st.expander('Vollständiges Zielportfolio mit beibehaltenen Positionen'):
+                                    st.dataframe(plans,hide_index=True,use_container_width=True)
+                            st.caption('**Voraussetzung:** Alle vorherigen Empfehlungen wurden tatsächlich '
+                                       'umgesetzt. Die Anzeige kennt deinen Brokerbestand nicht. '
+                                       'Positionsgrößen sind Soll-Gewichte; exakte Orders, Spreads und '
+                                       'abweichende Broker-Kurse musst du vor Ausführung prüfen. '
+                                       'Der separate Risk Guard ist nur Analyse; verbindlich ist '
+                                       'ausschließlich der gewählte SPY-SMA200-Filter.')
+                            with st.expander('🔒 Signal-Original sichern oder wiederherstellen'):
+                                st.caption('Neue Signale werden während dieser Sitzung automatisch '
+                                           'als Original fixiert. Streamlit Cloud speichert diese '
+                                           'Information ohne externe Datenbank NICHT dauerhaft. '
+                                           'Nutze den JSON-Export und importiere ihn bei einer späteren Sitzung.')
+                                archive_package={'schema_version':_MT_SIGNAL_ARCHIVE_SCHEMA,
+                                                 'signals':list(archive.values())}
+                                st.download_button('📥 Originalsignale herunterladen (JSON)',
+                                                   data=json.dumps(archive_package,ensure_ascii=False,indent=2).encode('utf-8'),
+                                                   file_name='momentum_signale.json',mime='application/json',
+                                                   key='mt_signal_export')
+                                imported=st.file_uploader('Gespeichertes Signalarchiv laden',type=['json'],
+                                                          key='mt_signal_import_file')
+                                if st.button('Gespeicherte Signale übernehmen',
+                                             disabled=imported is None,key='mt_signal_import_button'):
+                                    try:
+                                        loaded=json.loads(imported.getvalue().decode('utf-8-sig'))
+                                        st.session_state['mt_signal_archive'].update(mt_validate_archive(loaded))
+                                        st.rerun()
+                                    except (ValueError,TypeError,UnicodeDecodeError) as exc:
+                                        st.error(f'Ungültige Archivdatei: {exc}')
+                            st.caption('Originalsignale werden nicht stillschweigend durch neu geladene '
+                                       'historische Kurse überschrieben. Bei Parameteränderungen wird '
+                                       'eine neue Signal-ID verwendet.')
+
+                        # EURO-NETTO-BACKTEST AN ERSTER STELLE, SIGNALLOGIK UNVERÄNDERT
                         st.divider()
                         st.subheader('💶 Euro-Depot: nach Handelskosten und modellierten Steuern')
                         _mt_glossary_popover('ⓘ Euro-Depot und Steuermodell erklärt', [
@@ -3123,41 +2918,18 @@ if tab7.open:
                                 _n_a, _n_b = st.columns(2)
                                 _n_a.metric('A – verbleibendes Cash', format_de(info5['cash']))
                                 _n_b.metric('B – verbleibendes Cash', format_de(info10['cash']))
-                                for sysname, tr, info in [('A – 5 Tage', trades5, info5),
-                                                          ('B – 10 Tage', trades10, info10)]:
-                                    with st.expander(f'📒 Handelsjournal {sysname} ({len(tr)} Vorgänge)'):
-                                        st.caption('Steuerbuchungen sind separate Ereignisse; Steuererstattungen '
-                                                   'werden innerhalb des Modelljahres gegengerechnet. '
-                                                   'Verfügbare Liquidität und Ganzstückhandel können '
-                                                   'Abweichungen vom idealen Zielgewicht verursachen.')
-                                        if not tr.empty:
-                                            view = tr.sort_values('Datum', ascending=False).head(200).copy()
-                                            view['Datum'] = pd.to_datetime(view['Datum']).dt.strftime('%d.%m.%Y')
-                                            st.dataframe(view, use_container_width=True, hide_index=True)
-                                            st.download_button('CSV-Handelsjournal herunterladen',
-                                                data=tr.to_csv(index=False).encode('utf-8-sig'),
-                                                file_name=f'momentum_journal_{sysname[0]}.csv',
-                                                mime='text/csv', key=f'v7_journal_{sysname[0]}')
-                                        if info['position_values_eur']:
-                                            positions_df = pd.DataFrame([
-                                                {'Ticker': ticker, 'Stückzahl (modelliert)': info['positions'][ticker],
-                                                 'Positionswert (€)': value}
-                                                for ticker, value in info['position_values_eur'].items()
-                                            ])
-                                            st.markdown('**Modellierte letzte Depotpositionen**')
-                                            st.dataframe(positions_df, use_container_width=True, hide_index=True)
-                                        st.caption('Zusätzliche modellierte Steuer bei sofortiger Komplettveräußerung: '
-                                                   f'{format_de(info["liquidation_tax_additional"])}. '
-                                                   'Der Liquidationswert zieht auch Verkaufsgebühren ab.')
+                                st.caption('Die detaillierte, interne FIFO-Transaktionsliste dient '
+                                           'nur der Berechnung von Kosten und Steuern. '
+                                           'Eine separate Depot- oder Handelsbuchführung entfällt.')
                             except Exception as exc:
-                                LOG.exception('V7-Euro-Depot-Simulation fehlgeschlagen')
+                                LOG.exception('Euro-Depot-Simulation fehlgeschlagen')
                                 st.error(f'Euro-Depot-Simulation nicht verfügbar: {exc}')
                         else:
                             st.caption('Die Euro-Nettosimulation ist links deaktiviert. '
                                        'Die ursprünglichen Brutto-Backtests bleiben sichtbar.')
 
-                        # V9 – UNABHAENGIGES FRUEHWARNSYSTEM; READ-ONLY UND OPT-IN-BACKTEST.
-                        # Keine Veraenderung der Momentum-Scores, Zielholdings oder Depotorders.
+                        # Unabhängiger Risk Guard: nur Analyse, nicht Teil des Handelssignals.
+                        _guard = None
                         st.divider()
                         with st.expander('🛡️ Momentum Risk Guard – Frühwarnsystem für Verlustphasen', expanded=True):
                             st.info('**Risikoampel: 0 Punkte = geringere Warnsignale (besser), '
@@ -3370,7 +3142,7 @@ if tab7.open:
                                    'werden berücksichtigt. Eine abgeschlossene Kursdatenlieferung '
                                    'kann kurz nach Börsenschluss verzögert eintreffen.')
 
-                        # V10: KLARE DATIERUNG DER HANDELSPERIODEN UND HISTORISCHE AKTIENLISTEN
+                        # KLARE DATIERUNG DER HANDELSPERIODEN UND HISTORISCHE AKTIENLISTEN
                         st.divider()
                         st.subheader('📆 Aktuelle und vergangene Momentum-Perioden')
                         st.caption('**Von–bis** bezeichnet die Gültigkeit zwischen zwei geplanten '
@@ -3463,67 +3235,66 @@ if tab7.open:
                                    'in aufeinanderfolgenden Perioden stehen. '
                                    'Vergangenheitsdaten können nach Yahoo-Datenkorrekturen abweichen.')
 
-                        # 4. AKTUELLE ZIELPORTFOLIOS UND MANUELLE SIGNALDIFFERENZEN
+                        # 4. TRANSPARENTE MODELL-HOLDINGS UND SIGNALQUALITÄT
                         st.divider()
-                        st.subheader('🏆 Letzte Zielportfolios und manuelle Handelssignale')
-                        st.info('Das sind **modellierte Zielbestände**, nicht automatisch die echten '
-                                'Positionen deines Brokers. Für konkrete Kauf-/Verkaufsdifferenzen '
-                                'kannst du deine derzeit gehaltenen Ticker eingeben.')
-                        depot_text = st.text_input(
-                            'Eigene aktuell gehaltene Ticker (optional, kommagetrennt)',
-                            value='', placeholder='z. B. AAPL, NVDA, MSFT',
-                            key='mtv2_real_holdings'
-                        )
-                        owned = {_mt_symbol(x) for x in depot_text.replace(';', ',').split(',') if x.strip()}
+                        st.subheader('🏆 Zielaktien beider Strategien')
+                        for _label, _hold, _days, _stat in [
+                            ('System A – 5 Tage',holdings_5,5,kpis_5),
+                            ('System B – 10 Tage',holdings_10,10,kpis_10)]:
+                            with st.expander(_label,expanded=(_days==(5 if active_system=='A' else 10))):
+                                st.caption(f"Letztes Signal: {_stat.get('last_signal_date','–')} · "
+                                           f"Folgende Modell-Ausführung: {_stat.get('next_execution','–')} · "
+                                           f"Aktienquote: {fmt(100*_stat.get('target_exposure',0))}")
+                                if _hold.empty:
+                                    st.info('Keine qualifizierten Positionen (Cash).')
+                                else:
+                                    _view=_hold.copy()
+                                    _view['Unternehmen']=_view['Unternehmen'].astype(str)
+                                    _view['Zielgewicht (%)']=_view['Zielgewicht (%)'].round(2)
+                                    _view['Score']=_view['Score'].round(3)
+                                    st.dataframe(_view[['Ticker','Unternehmen','Score','Zielgewicht (%)']],
+                                                 hide_index=True,use_container_width=True)
+                        st.caption('Nur das links gewählte System ist verbindlich. '
+                                   'Die zweite Liste bleibt für den Strategie-Vergleich sichtbar.')
 
-                        def display_holdings(frame, days, stats):
-                            st.markdown(f'#### {"⚡ System A" if days == 5 else "🛡️ System B"}: '
-                                        f'{days}-Tage-Rotation')
-                            if stats['last_signal_date']:
-                                st.caption(f'Signal vom {stats["last_signal_date"]} | '
-                                           f'ursprüngliche nächste Ausführung: {stats["next_execution"]} '
-                                           f'(zum US-Schlusskurs) | '
-                                           f'Aktienquote im Ziel: {fmt(stats["target_exposure"] * 100)}')
-                            if frame.empty:
-                                st.warning('Keine qualifizierten Aktien im aktuellen Zielportfolio (Cash).')
-                            else:
-                                formatted = frame.copy()
-                                for c in ['Score', 'Trend-Qualität (R²)']:
-                                    formatted[c] = formatted[c].map(lambda x: fmt(x, 3, ''))
-                                for c in [f'Rendite ({days} Tage)', 'Rendite (T-130 bis T-5)',
-                                          'Volatilität', 'Zielgewicht (%)']:
-                                    formatted[c] = formatted[c].map(lambda x: fmt(x))
-                                formatted['Aktueller Kurs'] = formatted['Aktueller Kurs'].map(lambda x: fmt(x, 2, ' $'))
-                                formatted = formatted.rename(columns={'Aktueller Kurs': 'Kurs am Signaltag'})
-                                st.caption('ⓘ Die Spalten werden ausschließlich über „Spalten erklärt“ erläutert.')
-                                _mt_glossary_popover('ⓘ Spalten erklärt', list(formatted.columns))
-                                st.dataframe(formatted, hide_index=True, use_container_width=True)
-
-                            if depot_text.strip():
-                                base = owned
-                                reference = 'deinen eingegebenen Depot-Tickern'
-                            else:
-                                base = set(stats['simulated_tickers'])
-                                reference = 'den simulierten Beständen (keine echten Depotdaten)'
-                            desired = set(stats['target_tickers']) if stats['target_exposure'] > 0 else set()
-                            buy = sorted(desired - base)
-                            sell = sorted(base - desired)
-                            stay = sorted(desired & base)
-                            st.write(f'**Tickerdifferenz zu {reference}:**')
-                            st.write('🟢 Neue Ticker: ' + (', '.join(buy) if buy else 'keine'))
-                            st.write('🔴 Zu entfernende Ticker: ' + (', '.join(sell) if sell else 'keine'))
-                            st.write('🔵 Weiter zu halten: ' + (', '.join(stay) if stay else 'keine'))
-                            st.caption('Die Anzeige vergleicht nur Tickernamen. Auch bei gleichen Tickern '
-                                       'können Gewichtsanpassungen nötig sein; ohne Stückzahlen '
-                                       'und Depotwerte werden keine Stückzahl-Orders berechnet.')
-
-                        display_holdings(holdings_5, 5, kpis_5)
                         st.divider()
-                        display_holdings(holdings_10, 10, kpis_10)
+                        st.subheader('🔎 Signalqualität – welche Empfehlungen liefen schlecht?')
+                        st.caption('Rein historische Diagnose auf Basis der **zum Signaltag verfügbaren** '
+                                   'Informationen. Renditen werden erst ab dem modellierten '
+                                   'Ausführungsschlusskurs gemessen. Offene Perioden zählen nicht '
+                                   'als abgeschlossene Verlustsignale.')
+                        _hist_count=st.selectbox('Anzahl historischer Signale',[10,20,50,100],index=1,
+                                                  key='mt_signal_history_count')
+                        _active_snaps=(kpis_5 if active_system=='A' else kpis_10).get('signal_snapshots',[])
+                        _guard_history=_guard
+                        _hist=mt_signal_outcomes(close_all,_active_snaps,max_rows=_hist_count+1,
+                                                 risk_guard=_guard_history)
+                        if _hist.empty:
+                            st.info('Noch nicht genügend berechenbare Signalperioden vorhanden.')
+                        else:
+                            _closed=_hist[_hist['Status']=='Abgeschlossen'].dropna(
+                                subset=['Signalzyklus-Rendite (%)'])
+                            _k1,_k2,_k3=st.columns(3)
+                            _k1.metric('Abgeschlossene Signalzyklen',len(_closed))
+                            _k2.metric('Verlustzyklen',str(int((_closed['Signalzyklus-Rendite (%)']<0).sum())))
+                            _k3.metric('Verlustzyklen (%)',
+                                       f"{100*(_closed['Signalzyklus-Rendite (%)']<0).mean():.1f} %"
+                                       if not _closed.empty else '–')
+                            st.dataframe(_hist,hide_index=True,use_container_width=True)
+                            if not _closed.empty:
+                                with st.expander('Die fünf schwächsten abgeschlossenen Signalzyklen'):
+                                    st.dataframe(_closed.nsmallest(5,'Signalzyklus-Rendite (%)'),
+                                                 hide_index=True,use_container_width=True)
+                            st.download_button('Signaldiagnostik als CSV',
+                                               data=_hist.to_csv(index=False).encode('utf-8-sig'),
+                                               file_name='momentum_signaldiagnose.csv',mime='text/csv',
+                                               key='mt_signal_diagnostics_export')
+                        st.caption('Die Periodenrendite ist eine **Näherung** aus den bereinigten '
+                                   'Schlusskursen und dem Ziel-Aktienanteil. Sie ersetzt **nicht** '
+                                   'die exakte Brutto-/Netto-Depotsimulation. Risikowert: '
+                                   '0 = geringe Warnsignale, 100 = hohe Warnsignale.')
 
-                        mt_live_depot_comparison(holdings_5, holdings_10, kpis_5, kpis_10, close_all.index[-1])
-
-                        # V7 – ZUSÄTZLICHE RISIKOGRAFIKEN / KALENDERJAHRE
+                        # ZUSÄTZLICHE RISIKOGRAFIKEN / KALENDERJAHRE
                         st.divider()
                         st.subheader('📉 Risikoverlauf und jährliche Renditen')
                         wealth_curves = 100.0 + combo[['System A (5 Tage)',
