@@ -1864,14 +1864,193 @@ def fetch_asset_chart_prices(ticker, period):
         return pd.Series(dtype=float)
 
 
+# ================================================================
+# REALE RENDITE: RECHENKERN (ohne externe Daten / API-Abfragen)
+# ================================================================
+
+def rr_effective_tax_rate(capital_tax_pct=25.0, solidarity=True, church_pct=0.0):
+    """DE-Standardmodell: KapESt mit Kirchensteueranrechnung (§ 32d EStG)."""
+    k = float(church_pct) / 100.0
+    base = float(capital_tax_pct) / 100.0
+    if not 0 <= base <= 1 or k not in (0.0, 0.08, 0.09):
+        raise ValueError("Ungültige Steuersätze")
+    # Kirchensteuer mindert die Bemessung der KapESt, nicht nur ein additiver Zuschlag.
+    income_tax_rate = base / (1.0 + base * k)
+    return income_tax_rate * (1.0 + (0.055 if solidarity else 0.0) + k)
+
+
+def rr_monthly_money_weighted_rate(start_capital, monthly_payment, months, ending_value):
+    """Geldgewichtete Rendite p.a. aus Endwert und Einzahlungen am jeweiligen Monatsende.
+
+    Keine Zeitreihe tagesgenauer Cashflows: alle Monate sind modellhaft gleich lang.
+    Für positive Zahlungen ist der Endwert monoton in der Monatsrendite.
+    """
+    start_capital = float(start_capital)
+    monthly_payment = float(monthly_payment)
+    ending_value = float(ending_value)
+    months = int(months)
+    if months <= 0 or (start_capital <= 0 and monthly_payment <= 0):
+        return float('nan')
+
+    def future_value(rate):
+        val = start_capital
+        for _ in range(months):
+            val = val * (1.0 + rate) + monthly_payment
+            if val > 1e100:
+                return float('inf')
+        return val
+
+    if ending_value <= 0 and monthly_payment == 0:
+        return -1.0
+    if ending_value < monthly_payment and monthly_payment > 0:
+        # Verlust der am letzten Tag neu eingezahlten Sparrate lässt sich im Modell
+        # (Einzahlung erst am Monatsende) nicht als Geldrendite darstellen.
+        return float('nan')
+    low, high = -0.999999, 1.0
+    if future_value(low) > ending_value or future_value(high) < ending_value:
+        return float('nan')
+    for _ in range(85):
+        mid = (low + high) / 2.0
+        if future_value(mid) > ending_value:
+            high = mid
+        else:
+            low = mid
+    rm = (low + high) / 2.0
+    return (1.0 + rm) ** 12 - 1.0
+
+
+def rr_calculate(start_capital, annual_return_pct, years, inflation_pct=2.0,
+                 monthly_payment=0.0, annual_product_cost_pct=0.0,
+                 tax_mode='end', available_allowance=1000.0,
+                 partial_exemption_pct=0.0, capital_tax_pct=25.0,
+                 solidarity=True, church_pct=0.0, months=None):
+    """Vergleichs-/Planungsmodell einer Geldanlage, kein Steuerbescheid.
+
+    tax_mode='end'    : alle Gewinne erst bei Liquidation am Jahresende besteuert.
+    tax_mode='annual' : 100 % zum Jahresende verkauft & sofort wieder angelegt;
+                        jährlicher Pauschbetrag, vereinfachter Verlustvortrag.
+    tax_mode='none'   : kein Steuerabzug.
+    Monatliche Einzahlung am Monatsende. Jahreskosten proportional eingepreist.
+    Kursrückgang führt zu keiner automatischen Steuererstattung.
+    """
+    capital = float(start_capital)
+    r = float(annual_return_pct) / 100.0
+    inflation = float(inflation_pct) / 100.0
+    payment = float(monthly_payment)
+    annual_cost = float(annual_product_cost_pct) / 100.0
+    allowance = float(available_allowance)
+    exemption = float(partial_exemption_pct) / 100.0
+    total_months = int(months if months is not None else 12 * years)
+    years = total_months / 12.0
+    if not (capital > 0 and payment >= 0 and 1 <= total_months <= 600 and
+            r >= -1 and inflation > -1 and 0 <= annual_cost < 1 and
+            allowance >= 0 and 0 <= exemption <= 1 and
+            tax_mode in ('end', 'annual', 'none')):
+        raise ValueError("Ungültige Eingabewerte für die Renditeberechnung")
+
+    tax_rate = rr_effective_tax_rate(capital_tax_pct, solidarity, church_pct)
+    gross_monthly = (1.0 + r) ** (1.0 / 12.0) - 1.0
+    net_cost_monthly = ((1.0 + r) * (1.0 - annual_cost)) ** (1.0 / 12.0) - 1.0
+    gross = capital
+    value = capital
+    paid = capital
+    tax_total = 0.0
+    tax_loss_carry = 0.0
+    rows = [{
+        'Jahr': 0, 'Einzahlungen': capital, 'Brutto': capital,
+        'Nach Produktkosten / vor Steuern': capital, 'Nach Steuern': capital,
+        'Kaufkraft nach Steuern': capital, 'Im Jahr gezahlte Steuer': 0.0,
+        'Steuern kumuliert': 0.0
+    }]
+    year_start = value
+    year_paid = 0.0
+    for m in range(1, total_months + 1):
+        gross = gross * (1.0 + gross_monthly) + payment
+        value = value * (1.0 + net_cost_monthly) + payment
+        paid += payment
+        year_paid += payment
+        is_period_end = (m % 12 == 0) or (m == total_months)
+        if not is_period_end:
+            continue
+        paid_tax = 0.0
+        pre_current_tax = value
+        if tax_mode == 'annual':
+            # Vollständiger Verkauf an jedem Modelljahresende und am letzten
+            # (ggf. unvollständigen) Modelljahr; Neubeginn der Einstands-Basis.
+            gain = (value - year_start - year_paid) * (1.0 - exemption)
+            if gain < 0:
+                tax_loss_carry += -gain
+            else:
+                after_loss = max(0.0, gain - tax_loss_carry)
+                tax_loss_carry = max(0.0, tax_loss_carry - gain)
+                taxable = max(0.0, after_loss - allowance)
+                paid_tax = taxable * tax_rate
+                value -= paid_tax
+                tax_total += paid_tax
+            after_tax = value
+        elif tax_mode == 'end':
+            # Unverwendete Freibeträge früherer Jahre werden NICHT kumuliert.
+            gain = max(0.0, value - paid) * (1.0 - exemption)
+            paid_tax = max(0.0, gain - allowance) * tax_rate
+            after_tax = value - paid_tax
+        else:
+            after_tax = value
+        elapsed_years = m / 12.0
+        rows.append({
+            'Jahr': elapsed_years, 'Einzahlungen': paid, 'Brutto': gross,
+            'Nach Produktkosten / vor Steuern': pre_current_tax,
+            'Nach Steuern': after_tax,
+            'Kaufkraft nach Steuern': after_tax / ((1.0 + inflation) ** elapsed_years),
+            'Im Jahr gezahlte Steuer': paid_tax,
+            'Steuern kumuliert': tax_total if tax_mode == 'annual' else paid_tax
+        })
+        year_start = value
+        year_paid = 0.0
+
+    frame = pd.DataFrame(rows)
+    last = frame.iloc[-1]
+    net_end = float(last['Nach Steuern'])
+    gross_end = float(last['Brutto'])
+    pretax_end = float(last['Nach Produktkosten / vor Steuern'])
+    paid_total = float(last['Einzahlungen'])
+    total_tax = float(last['Steuern kumuliert'])
+    infl_factor = (1.0 + inflation) ** years
+    # Gegenwert sämtlicher Einzahlungen in der Kaufkraft des Startzeitpunkts.
+    # Beginn t=0 plus monatliche Einzahlungen am jeweiligen Monatsende.
+    inflation_adjusted_payments = capital + sum(
+        payment / (1.0 + inflation) ** (m / 12.0)
+        for m in range(1, total_months + 1)
+    )
+    net_ann = rr_monthly_money_weighted_rate(capital, payment, total_months, net_end)
+    real_ann = ((1.0 + net_ann) / (1.0 + inflation) - 1.0) if np.isfinite(net_ann) else float('nan')
+    summary = {
+        'end_gross': gross_end,
+        'end_before_tax': pretax_end,
+        'end_after_tax': net_end,
+        'end_real': net_end / infl_factor,
+        'paid_total': paid_total,
+        'gain_nominal_net': net_end - paid_total,
+        'gain_real': net_end / infl_factor - inflation_adjusted_payments,
+        'real_value_paid': inflation_adjusted_payments,
+        'total_taxes': total_tax,
+        'cost_impact': gross_end - pretax_end if tax_mode != 'annual' else float('nan'),
+        'net_annual_return': net_ann,
+        'real_annual_return': real_ann,
+        'effective_tax_rate': tax_rate if tax_mode != 'none' else 0.0,
+        'tax_mode': tax_mode,
+        'years': years,
+    }
+    return frame, summary
+
+
 # ---------------------------------------------
-# APP LAYOUT: ALLE SIEBEN BESTEHENDEN TABS + NEUER CHART-TAB
+# APP LAYOUT: BESTEHENDE ACHT TABS + REALE RENDITE
 # ---------------------------------------------
 st.title("📊 Integriertes Finanz-Terminal")
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8=st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9=st.tabs([
     "🌐 Makro & Markt", "🧭 Thematic Trends", "📈 Backtesting", "🎲 MC Asset",
     "🥧 MC Portfolio", "💶 Steuern", "🚀 S&P 500 Dual-Tracker",
-    "📉 Chart & SMA",
+    "📉 Chart & SMA", "🧮 Reale Rendite",
 ], on_change="rerun", key="finanz_v10_active_tab")
 
 # ==========================================
@@ -3595,3 +3774,266 @@ if tab8.open:
                     file_name=f"Chart_SMA_{safe_file_symbol}.csv", mime="text/csv",
                     key="asset_sma_csv"
                 )
+
+
+# ================================================================
+# TAB 9: REALE RENDITE (NACH STEUERN UND INFLATION)
+# ================================================================
+if tab9.open:
+    with tab9:
+        st.markdown('### 🧮 Reale Rendite – was bleibt nach Steuern und Inflation?')
+        st.caption(
+            'Ein interaktiver Rechner für historische Renditen oder Zukunftsszenarien. '
+            '„Real“ bedeutet hier: um den Kaufkraftverlust durch Inflation bereinigt. '
+            'Alle Euro-Beträge und Sätze kannst du selbst anpassen.'
+        )
+        rr_left, rr_right = st.columns([1, 1.85], gap='large')
+        with rr_left:
+            st.markdown('#### 1. Investment und Rendite')
+            rr_capital = st.number_input(
+                'Angelegtes Startkapital (€)', min_value=1.0, value=10000.0,
+                step=500.0, format='%.2f', key='rr_capital',
+                help='Bereits investierter Anfangsbetrag. Nur Gewinne, nicht das eingesetzte Kapital, sind in diesem Modell steuerpflichtig.'
+            )
+            rr_unit = st.radio('Zeitraum eingeben in', ['Jahren', 'Monaten'],
+                               horizontal=True, key='rr_time_unit')
+            if rr_unit == 'Jahren':
+                rr_months = 12 * st.slider(
+                    'Betrachtungszeitraum (Jahre)', min_value=1, max_value=50,
+                    value=10, key='rr_years',
+                    help='Wie viele Jahre die Anlage betrachtet beziehungsweise modelliert wird.'
+                )
+            else:
+                rr_months = st.number_input(
+                    'Betrachtungszeitraum (Monate)', min_value=1, max_value=600,
+                    value=18, step=1, key='rr_months'
+                )
+            rr_years = rr_months / 12.0
+            rr_input_type = st.radio(
+                'Wie möchtest du die Rendite eingeben?',
+                ['Jahresrendite (%)', 'Gesamtrendite (%)', 'Tatsächlicher Endwert (€)'],
+                key='rr_input_type',
+                help='Eine Jahresrendite lässt sich prognostizieren. Eine Gesamtrendite oder ein Endwert eignen sich für ein bereits abgeschlossenes Investment.'
+            )
+            if rr_input_type == 'Jahresrendite (%)':
+                rr_input_return = st.number_input(
+                    'Angenommene / erzielte Rendite pro Jahr (%)',
+                    min_value=-99.0, max_value=250.0, value=8.0,
+                    step=0.5, key='rr_annual_input',
+                    help='Gleichbleibende geometrische Jahresrendite als Szenario, vor optionalen jährlichen Produktkosten.'
+                )
+                rr_annual_return = float(rr_input_return)
+            elif rr_input_type == 'Gesamtrendite (%)':
+                rr_input_total = st.number_input(
+                    'Erzielte / angenommene Gesamtrendite (%)',
+                    min_value=-99.9, max_value=100000.0, value=100.0,
+                    step=5.0, key='rr_total_input',
+                    help='Gesamte Wertänderung über alle Jahre, ohne zwischenzeitliche Ein- und Auszahlungen.'
+                )
+                rr_annual_return = 100.0 * (
+                    (1.0 + float(rr_input_total) / 100.0) ** (1.0 / rr_years) - 1.0
+                )
+            else:
+                rr_end_actual = st.number_input(
+                    'Endwert des Investments (€)', min_value=0.0,
+                    value=18000.0, step=500.0, format='%.2f',
+                    key='rr_final_value_input',
+                    help='Wert vor modelliertem Steuerabzug. Nur geeignet, wenn es keine unterjährigen Ein- oder Auszahlungen gab.'
+                )
+                rr_annual_return = 100.0 * (
+                    (float(rr_end_actual) / float(rr_capital)) ** (1.0 / rr_years) - 1.0
+                )
+            rr_allow_savings = rr_input_type == 'Jahresrendite (%)'
+            rr_monthly = st.number_input(
+                'Zusätzliche monatliche Einzahlung (€)', min_value=0.0,
+                value=0.0, step=50.0, format='%.2f', key='rr_monthly',
+                disabled=not rr_allow_savings,
+                help='Monatliche Einzahlung jeweils am Monatsende. Bei Gesamtrendite/Endwert sind weitere Einzahlungen ohne genaue Zahlungshistorie nicht eindeutig rekonstruierbar.'
+            )
+            if not rr_allow_savings:
+                st.caption('Bei Gesamtrendite/Endwert sind Sparraten deaktiviert. Die unterjährige Kurve wird gleichmäßig modelliert, nicht historisch rekonstruiert.')
+            rr_product_fee = st.number_input(
+                'Zusätzliche jährliche Produktkosten (%)',
+                min_value=0.0, max_value=15.0, value=0.0,
+                step=0.1, key='rr_fee', disabled=not rr_allow_savings,
+                help='Nur Kosten ergänzen, die noch nicht in der eingegebenen Jahresrendite stecken (sonst Doppelzählung).'
+            )
+
+            st.markdown('#### 2. Steuern und Inflation')
+            rr_inflation = st.number_input(
+                'Durchschnittliche Inflation pro Jahr (%)',
+                min_value=-5.0, max_value=30.0, value=2.0,
+                step=0.25, key='rr_inflation',
+                help='Konstante Annahme: mit steigender Inflation sinkt die Kaufkraft deines Endvermögens.'
+            )
+            rr_tax_label = st.selectbox(
+                'Wann fallen Steuern an?',
+                [
+                    'Beim Verkauf am Ende (Standard)',
+                    'Jedes Jahr verkaufen und wieder anlegen',
+                    'Keine Steuern (Vergleich)',
+                ], key='rr_tax_mode',
+                help='Beim Verkauf nur ein Pauschbetrag im Verkaufsjahr. Bei jährlicher Realisierung fällt der Freibetrag modellhaft jedes Jahr neu an.'
+            )
+            rr_tax_mode = {
+                'Beim Verkauf am Ende (Standard)': 'end',
+                'Jedes Jahr verkaufen und wieder anlegen': 'annual',
+                'Keine Steuern (Vergleich)': 'none',
+            }[rr_tax_label]
+            rr_asset_label = st.selectbox(
+                'Art der Kapitalanlage',
+                [
+                    'Einzelaktien / Zinsen / Sonstige (0 %)',
+                    'Aktienfonds / Aktien-ETF (30 % Teilfreistellung)',
+                    'Mischfonds (15 % Teilfreistellung)',
+                ], key='rr_asset_class',
+                help='Die Fonds-Teilfreistellung betrifft qualifizierende Fonds, nicht gewöhnliche Einzelaktien. Bitte die Klassifizierung deines Fonds prüfen.'
+            )
+            rr_exemption = {
+                'Einzelaktien / Zinsen / Sonstige (0 %)': 0.0,
+                'Aktienfonds / Aktien-ETF (30 % Teilfreistellung)': 30.0,
+                'Mischfonds (15 % Teilfreistellung)': 15.0,
+            }[rr_asset_label]
+            rr_allowance = st.number_input(
+                'Noch verfügbarer Sparer-Pauschbetrag je Steuerjahr (€)',
+                min_value=0.0, max_value=2000.0, value=1000.0,
+                step=100.0, format='%.2f', key='rr_allowance',
+                disabled=rr_tax_mode == 'none',
+                help='In Deutschland regulär 1.000 € (einzeln), 2.000 € (zusammenveranlagt). Gib nur den Anteil ein, der für dieses Investment noch verfügbar ist. Nicht genutzte Beträge sind nicht auf spätere Jahre übertragbar.'
+            )
+            with st.expander('⚙️ Steuerdetails (optional)'):
+                rr_capital_tax = st.number_input(
+                    'Kapitalertragsteuersatz (%)', min_value=0.0,
+                    max_value=60.0, value=25.0, step=0.5,
+                    key='rr_capital_tax',
+                    help='Deutscher Standard: 25 %. Sonderfälle und individuelle günstigere Besteuerung werden nicht automatisch ermittelt.'
+                )
+                rr_soli = st.checkbox('Solidaritätszuschlag berücksichtigen (5,5 % auf Steuer)',
+                                      value=True, key='rr_soli')
+                rr_church = st.selectbox('Kirchensteuersatz', [0, 8, 9],
+                                         format_func=lambda n: 'Keine' if n == 0 else f'{n} %',
+                                         key='rr_church')
+                st.caption('Bei Kirchensteuerpflicht wird die Kapitalertragsteuer im deutschen Modell entsprechend gemindert.')
+
+        with rr_right:
+            try:
+                rr_path, rr_result = rr_calculate(
+                    start_capital=rr_capital,
+                    annual_return_pct=rr_annual_return,
+                    years=rr_years,
+                    months=rr_months,
+                    inflation_pct=rr_inflation,
+                    monthly_payment=rr_monthly if rr_allow_savings else 0.0,
+                    annual_product_cost_pct=rr_product_fee if rr_allow_savings else 0.0,
+                    tax_mode=rr_tax_mode,
+                    available_allowance=rr_allowance if rr_tax_mode != 'none' else 0.0,
+                    partial_exemption_pct=rr_exemption,
+                    capital_tax_pct=rr_capital_tax,
+                    solidarity=rr_soli,
+                    church_pct=rr_church,
+                )
+                st.markdown('#### Ergebnis: nominal und kaufkraftbereinigt')
+                a, b, c = st.columns(3)
+                a.metric('Endwert nach Steuern', format_de(rr_result['end_after_tax']),
+                         help='Modellierter Endbetrag nach gegebenenfalls fälligen Kapitalertragsteuern, jedoch in Euro des Endjahrs.')
+                b.metric('Kaufkraft in heutigen €', format_de(rr_result['end_real']),
+                         help='Endwert nach Steuern geteilt durch den kumulierten Inflationsfaktor; Wert in heutiger Kaufkraft.')
+                c.metric('Modellierte Steuern gesamt', format_de(rr_result['total_taxes']),
+                         help='Steuerabzüge beim Schlussverkauf oder kumuliert bei jährlicher Gewinnrealisation.')
+
+                a2, b2, c2 = st.columns(3)
+                nominal_ann = rr_result['net_annual_return']
+                real_ann = rr_result['real_annual_return']
+                a2.metric('Nettorendite p.a.',
+                          f"{nominal_ann*100:+.2f} %" if np.isfinite(nominal_ann) else '–',
+                          help='Geldgewichtete, annualisierte Rendite nach modellierter Steuer. Bei Sparraten werden Zeitpunkt und Höhe der Einzahlungen berücksichtigt.')
+                b2.metric('Reale Nettorendite p.a.',
+                          f"{real_ann*100:+.2f} %" if np.isfinite(real_ann) else '–',
+                          help='Geldgewichtete Jahresrendite nach Steuern, zusätzlich bereinigt um die angenommene Inflation.')
+                c2.metric('Realer Vermögenszuwachs',
+                          format_de(rr_result['gain_real']),
+                          help='Kaufkraftbereinigter Endwert minus alle Einzahlungen, jeweils in Kaufkraft des Startzeitpunkts.')
+
+                if rr_result['gain_real'] < -0.005:
+                    st.warning('**Kaufkraftverlust:** Unter diesen Annahmen ist der reale Wertzuwachs negativ, auch wenn das Investment nominal gewachsen sein kann.')
+                elif rr_result['gain_real'] > 0.005:
+                    st.success('**Positiver realer Wertzuwachs:** Nach den gewählten Steuer- und Inflationsannahmen steigt die Kaufkraft gegenüber den Einzahlungen.')
+                else:
+                    st.info('Der reale Wertzuwachs liegt unter den aktuellen Annahmen ungefähr bei null.')
+
+                st.markdown('#### Vermögensentwicklung')
+                fig_rr = go.Figure()
+                line_specs = [
+                    ('Brutto', 'Ohne Produktkosten und Steuern', '#7E8A97', 'dash'),
+                    ('Nach Steuern', 'Depotwert nach Steuern', '#168768', 'solid'),
+                    ('Kaufkraft nach Steuern', 'Nach Steuern, in heutiger Kaufkraft', '#D38A2D', 'solid'),
+                    ('Einzahlungen', 'Eingezahltes Kapital, nominal', '#5890C1', 'dot'),
+                ]
+                for col_name, label, color, dash in line_specs:
+                    fig_rr.add_trace(go.Scatter(
+                        x=rr_path['Jahr'], y=rr_path[col_name],
+                        name=label, mode='lines+markers',
+                        line=dict(color=color, width=2.5 if col_name != 'Einzahlungen' else 1.7, dash=dash),
+                        marker=dict(size=4),
+                        hovertemplate='Jahr %{x}: %{y:,.0f} €<extra>' + label + '</extra>',
+                    ))
+                fig_rr.update_layout(
+                    height=420, xaxis_title='Anlagejahr', yaxis_title='Wert (€)',
+                    hovermode='x unified', margin=dict(l=10, r=10, t=25, b=30),
+                    legend=dict(orientation='h', yanchor='top', y=-0.22, x=0),
+                )
+                st.plotly_chart(fig_rr, use_container_width=True,
+                                config={'displaylogo': False})
+
+                st.markdown('#### Zahlen im Überblick')
+                rr_table = pd.DataFrame([
+                    {'Größe': 'Eingesetztes Kapital inkl. Sparraten', 'Wert (€)': rr_result['paid_total']},
+                    {'Größe': 'Brutto-Endwert vor zusätzlichen Produktkosten und Steuern', 'Wert (€)': rr_result['end_gross']},
+                    {'Größe': 'Modellierte Steuern', 'Wert (€)': rr_result['total_taxes']},
+                    {'Größe': 'Endwert nach Steuern', 'Wert (€)': rr_result['end_after_tax']},
+                    {'Größe': 'Kaufkraft des Endwerts in heutigen Euro', 'Wert (€)': rr_result['end_real']},
+                    {'Größe': 'Nominaler Gewinn nach Steuer', 'Wert (€)': rr_result['gain_nominal_net']},
+                    {'Größe': 'Realer Gewinn in heutiger Kaufkraft', 'Wert (€)': rr_result['gain_real']},
+                ])
+                rr_table['Wert (€)'] = rr_table['Wert (€)'].map(lambda v: f'{format_de_num(v, 2)} €')
+                st.dataframe(rr_table, hide_index=True, use_container_width=True)
+                with st.expander('📖 Was bedeuten die Kennzahlen und Annahmen?'):
+                    st.markdown(
+                        '**Nominal** ist die Euro-Rendite ohne Berücksichtigung des Kaufkraftverlusts. '
+                        '**Real** berücksichtigt zusätzlich die Inflation. '
+                        '**Nettorendite** berücksichtigt im Rechner die gewählten modellierten Steuern '
+                        'und gegebenenfalls Produktkosten.\n\n'
+                        '**Steuern am Ende:** Der gesamte bis zum Verkauf aufgelaufene Kursgewinn '
+                        'wird einmal mit dem noch verfügbaren Pauschbetrag im Verkaufsjahr verrechnet. '
+                        'Ein nicht ausgeschöpfter Freibetrag der Vorjahre wird nicht nachträglich gesammelt.\n\n'
+                        '**Jährliche Realisierung:** Am Jahresende wird eine vollständige Veräußerung '
+                        'mit sofortiger Wiederanlage angenommen. Erträge werden je Kalenderjahr '
+                        'besteuert; steuerliche Verluste werden im vereinfachten Modell vorgetragen.\n\n'
+                        '**Einzahlungen:** Weitere Sparbeträge werden am Monatsende angelegt. '
+                        'Die annualisierte Nettorendite ist dann geldgewichtet, damit Einzahlungen '
+                        'nicht fälschlich als Investmentgewinn zählen.\n\n'
+                        '**Nicht enthalten:** Vorabpauschale von Fonds, Ausschüttungsbesteuerung, '
+                        'Quellensteuer, individuelle Steuerbesonderheiten, tatsächliche Kauf-/Verkaufskurse, '
+                        'separate Verlustverrechnungstöpfe und Gebühren des Brokers. '
+                        'Im Fall bereits erzielter Gewinne wird der Kursverlauf nur modellhaft geglättet. '
+                    'Bei einer bereits nach Steuern angegebenen Rendite bitte „Keine Steuern“ wählen.'
+                    )
+                st.caption(
+                    f"Annahme: {rr_annual_return:+.2f} % p.a. vor ggf. zusätzlichen Produktkosten, "
+                    f"{rr_inflation:.2f} % Inflation p.a., "
+                    f"{rr_result['effective_tax_rate']*100:.3f} % kombinierter Steuersatz "
+                    f"auf steuerpflichtige positive Erträge. Das ist eine vereinfachte "
+                    'private Kapitalanlage-Modellrechnung nach deutschem Steuerrecht (Stand 2026), '
+                    'keine Steuerberatung oder Renditeprognose.'
+                )
+                export_rr = rr_path.copy()
+                export_rr.index.name = 'Zeile'
+                st.download_button(
+                    '⬇️ Berechnung als CSV herunterladen',
+                    data=export_rr.to_csv(index=False, sep=';', decimal=',',
+                                          float_format='%.4f').encode('utf-8-sig'),
+                    file_name='Reale_Rendite_Berechnung.csv', mime='text/csv',
+                    key='rr_csv_download'
+                )
+            except (ValueError, OverflowError, ZeroDivisionError) as exc:
+                st.error(f'Berechnung nicht möglich: {exc}')
